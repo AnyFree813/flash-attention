@@ -87,6 +87,10 @@ namespace SplitFuse {
             uint32_t blockSize = fATilingData->blockSize;
             uint32_t maskType = fATilingData->maskType;
             float scaleValue = fATilingData->scaleValue;
+            bool alibiLeftAlign = false; // 当前固定为False，不支持左对齐
+ 	        bool isAlibiSqrt = false; // 当前固定为False，不支持sqrt缩放
+            
+            // 初始化全局张量
             AscendC::GlobalTensor<ElementQ> gQ;
             gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
             AscendC::GlobalTensor<ElementK> gK;
@@ -95,6 +99,8 @@ namespace SplitFuse {
             gV.SetGlobalBuffer((__gm__ ElementK *)params.v);
             AscendC::GlobalTensor<ElementMask> gMask;
             gMask.SetGlobalBuffer((__gm__ ElementMask *)params.mask);
+            AscendC::GlobalTensor<ElementQ> gPseShift; // 类型和Q一致
+ 	        gPseShift.SetGlobalBuffer((__gm__ ElementQ *)params.pseShift);
             AscendC::GlobalTensor<int32_t> gBlockTable;
             gBlockTable.SetGlobalBuffer((__gm__ int32_t *)(params.blockTables));
             AscendC::GlobalTensor<int64_t> gActualQseqlen;
@@ -105,6 +111,8 @@ namespace SplitFuse {
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<ElementLse> gLse;
             gLse.SetGlobalBuffer((__gm__ ElementLse *)params.lse);
+            AscendC::GlobalTensor<ElementLse> gAlibiCoeff; // 类型和lse一致
+ 	        gAlibiCoeff.SetGlobalBuffer((__gm__ ElementLse *)params.alibiCoeff);
             AscendC::GlobalTensor<ElementS> gS;
             gS.SetGlobalBuffer((__gm__ ElementS *)(params.workSpace));
             AscendC::GlobalTensor<ElementP> gP;
@@ -382,6 +390,29 @@ namespace SplitFuse {
                                     qNBlockSize,
                                     curStackTileMod);
                             }
+                        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_ALIBI) {
+                            epilogueOnlineSoftmax(
+                                gP[gmOffsetP],
+                                gS[gmOffsetS],
+                                gPseShift,
+                                gAlibiCoeff,
+                                gMask,
+                                layOutP,
+                                layOutS,
+                                layOutMask,
+                                actualBlockShapeQK,
+                                (stackSeqCount == 0),
+                                qSBlockSize,
+                                qNBlockSize,
+                                curStackTileMod,
+                                qkReady,
+                                triUp,
+                                kvSStartIdx,
+                                kvSEndIdx,
+                                qNStartIdx,
+                                alibiLeftAlign,
+                                isAlibiSqrt,
+                                doTriUMask);
                         } else {
                             Arch::CrossCoreWaitFlag(qkReady);
                             epilogueOnlineSoftmax(
@@ -544,12 +575,14 @@ namespace SplitFuse {
         GM_ADDR q,
         GM_ADDR k,
         GM_ADDR v,
+        GM_ADDR pseShift,
         GM_ADDR mask,
         GM_ADDR blockTables,
         GM_ADDR o,
         GM_ADDR lse,
         GM_ADDR actualQseqlen,
         GM_ADDR actualKvseqlen,
+        GM_ADDR alibiCoeff,
         GM_ADDR workspace,
         GM_ADDR tiling)
     {
@@ -589,8 +622,9 @@ namespace SplitFuse {
         using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
+        using pseShiftType = Gemm::GemmType<ElementQ, LayoutQ>;  // 类型和Q一致
         using EpilogueOnlineSoftmax =
-            Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, maskType>;
+            Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType, maskType, pseShiftType>;
 
         using L1TileShapePV = GemmShape<128, 128, 256>;
         using L0TileShapePV = GemmShape<128, 128, 128>;
@@ -609,7 +643,7 @@ namespace SplitFuse {
 
         using FAInferKernel = FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax, EpilogueRescaleO,
                                             PagedCacheFlag, maskCategory, inLayout>;
-        FAIKernelParams params{q, k, v, mask, blockTables, actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
+        FAIKernelParams params{q, k, v, pseShift, mask, blockTables, actualQseqlen, actualKvseqlen, alibiCoeff, o, lse, workspace, tiling};
         FAInferKernel flashAttnInfer;
         flashAttnInfer(params);
     }

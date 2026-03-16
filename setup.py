@@ -264,7 +264,7 @@ class BishengBuildExt(build_ext):
             "-shared",
             "-fPIC",
             "-std=c++17",
-            "-D_GLIBCXX_USE_CXX11_ABI=0",
+            "-D_GLIBCXX_USE_CXX11_ABI=1",
             *[f"-I{p}" for p in asc_config["include_dirs"]],
             f"-I{dep_paths['python']['include']}",
             f"-I{dep_paths['torch_npu']['include']}",

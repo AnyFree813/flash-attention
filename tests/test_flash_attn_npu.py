@@ -87,6 +87,8 @@ def ref_flash_attention(
     scale,
     mask,
     data_type,
+    alibi_slopes=None,
+    key_leftpad=None
     ):
     inner_prec = 0
     interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
@@ -117,6 +119,22 @@ def ref_flash_attention(
         qk_result = qk_result * scale
         if mask is not None:
             qk_result += sub_mask
+        # Apply alibi mask if provided
+        if alibi_slopes is not None:
+            batch_size, q_seqlen, num_heads, head_size = query.shape[1], query.shape[1], query.shape[0], query.shape[2]
+            alibi = torch.zeros(q_seqlen, sub_len, device=qk_result.device, dtype=interm_dtype)
+            for i in range(q_seqlen):
+                for j in range(sub_len):
+                    # 计算实际的键位置，考虑左对齐偏移
+                    actual_key_pos = j + kv_start
+                    if key_leftpad is not None:
+                        actual_key_pos -= key_leftpad
+                    alibi[i, j] = -abs(i - actual_key_pos)
+            alibi = alibi.unsqueeze(0).repeat(num_heads, 1, 1)
+            alibi_slopes_iter = alibi_slopes.unsqueeze(1).unsqueeze(2)
+            alibi = alibi * alibi_slopes_iter
+            qk_result += alibi
+
         if kv_start == 0:
             gm = None
         p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype)
@@ -139,14 +157,61 @@ def ref_flash_attention(
     return go.to(data_type), lse
 
 test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False),
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, mask_type)
+    # 基础测试用例
+    (torch.bfloat16, 1, 1, 1, 512, 512, 64, 0, 128, 0),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 64, 0, 128, 1),
+    (torch.bfloat16, 1, 1, 1, 512, 512, 64, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 128, 128, 128, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 256, 256, 128, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 512, 512, 128, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 1024, 1024, 128, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 2048, 2048, 128, 0, 128, 2),
+    (torch.bfloat16, 1, 4, 4, 2049, 2049, 128, 0, 128, 2),
+    
+    # 不同数据类型
+    (torch.float16, 1, 1, 1, 512, 512, 64, 0, 128, 2),
+    
+    # 不同 batch size
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),
+    (torch.float16, 2, 4, 4, 256, 256, 128, 0, 128, 2),
+    (torch.float16, 4, 4, 4, 256, 256, 128, 0, 128, 2),
+    
+    # 不同的 num_heads 和 kv_heads 组合
+    (torch.float16, 1, 8, 1, 256, 256, 64, 0, 128, 2),  # 8个注意力头共享1个KV头
+    (torch.float16, 1, 8, 2, 256, 256, 64, 0, 128, 2),  # 8个注意力头共享2个KV头
+    (torch.float16, 1, 8, 4, 256, 256, 64, 0, 128, 2),  # 8个注意力头共享4个KV头
+    (torch.float16, 1, 8, 8, 256, 256, 64, 0, 128, 2),  # 每个注意力头有自己的KV头
+    
+    # 不同的序列长度
+    (torch.float16, 1, 4, 4, 128, 128, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 1024, 1024, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 2048, 2048, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 2049, 2049, 128, 0, 128, 2),
+    
+    # 不同的 head_size
+    (torch.float16, 1, 4, 4, 256, 256, 64, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),
+    (torch.float16, 1, 4, 4, 256, 256, 256, 0, 128, 2),
+    
+    # 不同的缓存模式
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),  # 常规模式
+    (torch.float16, 1, 4, 4, 256, 256, 128, 1, 128, 2),  # 块缓存模式
+    
+    # 因果掩码设置
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),  # 非因果
+    (torch.float16, 1, 4, 4, 256, 256, 128, 0, 128, 2),   # 因果
+    
+    # 现有测试用例
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, 1),
+    (torch.float16, 1, 8, 2, 512, 512, 64, 0, 128, 2),
+    (torch.float16, 2, 12, 3, 256, 256, 128, 1, 128, 2),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal", test_cases)
-def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, mask_type", test_cases)
+def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, mask_type):
     q_min_range = -5.0
     q_max_range = 5.0
     kv_min_range = -5.0
@@ -185,6 +250,9 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     cache_batch_idx = None
     leftpad_k = None
     alibi_slopes = None
+    if mask_type == 2:
+        # Generate alibi slopes: num_heads
+        alibi_slopes = torch.rand(num_heads, device=query.device, dtype=torch.float32) * 0.3
     out_out, softmax_lse = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -197,7 +265,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=leftpad_k,
         block_table=block_tables,
-        causal=is_causal,
+        causal=mask_type,
         window_size=[window_size_left, window_size_right],
         rotary_interleaved=is_rotary_interleaved,
         alibi_slopes=alibi_slopes,
@@ -207,7 +275,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
     golden_lseL = torch.empty((batch_size, q_seqlen, num_heads), dtype=torch.float32)
     atten_mask = None
-    if is_causal:
+    if  mask_type:
         atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
     for i in range(batch_size):
         key_cache_per_batch = None
@@ -231,10 +299,12 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             key_cache_per_batch = key_cache.detach().cpu()[i]
             value_cache_per_batch = value_cache.detach().cpu()[i]
         query_cpu = query.detach().cpu()[i]
-        if is_causal:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type)
+        alibi_slopes_cpu = alibi_slopes.cpu() if alibi_slopes is not None else None
+        leftpad_k_cpu = leftpad_k.cpu() if leftpad_k is not None else None
+        if mask_type:
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, alibi_slopes_cpu, leftpad_k_cpu)
         else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type)
+            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, alibi_slopes_cpu, leftpad_k_cpu)
         out = output.reshape(q_seqlen, num_heads, head_size)
         golden_out[i:i+1] = out
         golden_lseL[i:i+1] = torch.transpose(golden_lse.reshape(num_heads, q_seqlen), 0, 1)
