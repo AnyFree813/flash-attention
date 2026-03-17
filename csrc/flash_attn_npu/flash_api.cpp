@@ -57,6 +57,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::Tensor k, v, rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes;
     bool is_bf16 = q.dtype() == torch::kBFloat16;
     const bool paged_KV = block_table_.has_value();
+    const bool is_alibi = alibi_slopes_.has_value();
     if (seqlens_k_.has_value()) {
         seqlens_k = seqlens_k_.value();
     }
@@ -75,7 +76,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (cache_batch_idx_.has_value()) {
         cache_batch_idx = cache_batch_idx_.value();
     }
-    if (alibi_slopes_.has_value()) {
+    if (is_alibi) {
         alibi_slopes = alibi_slopes_.value();
     }
     if (paged_KV) {
@@ -148,7 +149,16 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
     at::Tensor mask_gpu_tensor;
-    if (is_causal) {
+    at::Tensor pseShift_gpu_tensor;
+    if (is_alibi) {
+        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+
+        at::Tensor positions = at::arange(2048, at::device(c10::kCPU).dtype(at::kInt));
+        at::Tensor pseShift_cpu_tensor = -at::abs(positions.view({2048, 1}) -  positions.view({1, 2048}));
+        pseShift_gpu_tensor = pseShift_cpu_tensor.to(q.dtype()).to(at::Device(at::kPrivateUse1));
+    } else if (is_causal) {
         at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -163,10 +173,16 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto vDevice = static_cast<uint8_t *>(const_cast<void *>(vcache.storage().data()));
     uint8_t * blockTableDevice = nullptr;
     uint8_t * maskDevice = nullptr;
+    uint8_t * pseShiftDevice = nullptr;
+    uint8_t * alibiCoeffDevice = nullptr;
     if (paged_KV) {
         blockTableDevice = static_cast<uint8_t *>(const_cast<void *>(block_table.storage().data()));
     }
-    if (is_causal) {
+    if (is_alibi) {
+        maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
+        alibiCoeffDevice = static_cast<uint8_t *>(const_cast<void *>(alibi_slopes.storage().data()));
+        pseShiftDevice = static_cast<uint8_t *>(const_cast<void *>(pseShift_gpu_tensor.storage().data()));
+    } else if (is_causal) {
         maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
     }
     auto oDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
@@ -177,46 +193,62 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.storage().data()));
     if (is_bf16) {
         if (paged_KV) {
-            if (is_causal) {
+            if (is_alibi) {
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_ALIBI, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
+            } else if (is_causal) {
                 SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             } else {
                 SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             }
         } else {
-            if (is_causal) {
+            if (is_alibi) {
+                SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_ALIBI, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
+            } else if (is_causal) {
                 SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             } else {
                 SplitFuse::FAInfer<bfloat16_t, bfloat16_t, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             }
         }
     } else {
         if (paged_KV) {
-            if (is_causal) {
+            if (is_alibi) {
+                SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_ALIBI, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
+            } else if (is_causal) {
                 SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             } else {
                 SplitFuse::FAInfer<half, half, float, true, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             }
         } else {
-            if (is_causal) {
+            if (is_alibi) {
+                SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_ALIBI, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
+            } else if (is_causal) {
                 SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::MASK_CAUSAL, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             } else {
                 SplitFuse::FAInfer<half, half, float, false, FaiKenel::MaskType::NO_MASK, FaiKenel::inputLayout::BSND, Catlass::Epilogue::LseModeT::OUT_ONLY><<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                        fftsAddr, qDevice, kDevice, vDevice, pseShiftDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
+                        qSeqDevice, kvSeqDevice, alibiCoeffDevice, workspaceDevice, tilingDevice);
             }
         }
     }

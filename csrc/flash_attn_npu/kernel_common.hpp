@@ -44,7 +44,8 @@ namespace KernelCommon {
         enum class MaskType : uint32_t {
             NO_MASK = 0,
             MASK_CAUSAL = 1,
-            MASK_SPEC = 2
+            MASK_SPEC = 2,
+            MASK_ALIBI = 3
         };
 
         enum class inputLayout : uint32_t {
@@ -57,10 +58,12 @@ namespace KernelCommon {
         GM_ADDR q;
         GM_ADDR k;
         GM_ADDR v;
+        GM_ADDR pseShift;
         GM_ADDR mask;
         GM_ADDR blockTables;
         GM_ADDR actualQseqlen;
         GM_ADDR actualKvseqlen;
+        GM_ADDR alibiCoeff;
         GM_ADDR o;
         GM_ADDR lse;
         GM_ADDR workSpace;
@@ -68,10 +71,10 @@ namespace KernelCommon {
 
         __aicore__ inline FAIKernelParams() {}
 
-        __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
-                GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_)
-            : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
-                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_) {}
+        __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR pseShift_, GM_ADDR mask_, GM_ADDR blockTables_,
+                GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR alibiCoeff_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_, GM_ADDR tiling_)
+            : q(q_), k(k_), v(v_), pseShift(pseShift_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
+                actualKvseqlen(actualKvseqlen_), alibiCoeff(alibiCoeff_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_) {}
     };
 
     __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)

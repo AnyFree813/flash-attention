@@ -16,12 +16,14 @@ template <
     class OutputType_,
     class InputType_,
     class MaskType_,
+    class AlibiType_,
     LseModeT LSE_MODE_>
 class BlockEpilogue<
     EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>,
     OutputType_,
     InputType_,
-    MaskType_>
+    MaskType_,
+    AlibiType_>
 {
 public:
     using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>;
@@ -29,10 +31,12 @@ public:
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
     using ElementMask = typename MaskType_::Element;
+    using ElementAlibi = typename AlibiType_::Element;
 
     using LayoutOutput = typename OutputType_::Layout;
     using LayoutInput = typename InputType_::Layout;
     using LayoutMask = typename MaskType_::Layout;
+    using LayoutAlibi = typename AlibiType_::Layout;
 
     static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
 
@@ -46,12 +50,15 @@ public:
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;
-
+    static constexpr int32_t COMP_TRIU_MASK_DIM_LEN = 2048;
+    static constexpr int32_t Q_BLOCK_SIZE = 128;
     static constexpr uint32_t REDUCE_UB_SIZE = 1024;
     static constexpr uint32_t ROW_OPS_SPEC_MASK_32 = 32;
     static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
+    static constexpr uint32_t MAX_KV_STACK_LEN = 512;
+ 	static constexpr uint32_t HEAD_NUM_2 = 2;
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
@@ -61,6 +68,7 @@ public:
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t ALIBI32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
@@ -72,6 +80,7 @@ public:
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
 
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t ALIBI_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
         scaleValue = scaleValue_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
@@ -79,6 +88,8 @@ public:
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
         maskUbTensor16 = resource.ubBuf.template GetBufferByByte<half>(MASK16_UB_TENSOR_OFFSET);
         maskUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(MASK32_UB_TENSOR_OFFSET);
+        alibiUbTensor = resource.ubBuf.template GetBufferByByte<ElementAlibi>(ALIBI_UB_TENSOR_OFFSET); // 32K
+ 	    alibiUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ALIBI32_UB_TENSOR_OFFSET); // 32K
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
@@ -446,6 +457,171 @@ public:
     }
 
     __aicore__ inline
+    void CalcGmAlibiShift(bool alibiLeftAlign, int64_t &offsetAlibi, int32_t &alibiDelta, const LayoutInput layoutMask,
+        uint32_t triUp, uint32_t kvSStartIdx, uint32_t maskOffsetThisSubBlock)
+    {
+        int32_t alibiBlockStart = triUp - kvSStartIdx;
+        uint32_t gmOffsetAlibiRow;
+        uint32_t gmOffsetAlibiColumn;
+        if (alibiLeftAlign) {
+            //左对齐
+            if (alibiBlockStart >= COMP_TRIU_MASK_DIM_LEN) {
+                gmOffsetAlibiRow = 1024;  // 超过2048时取1024处的数据
+                alibiDelta = kvSStartIdx;
+                gmOffsetAlibiColumn = 0;
+            } else if (alibiBlockStart >= 0 && alibiBlockStart < COMP_TRIU_MASK_DIM_LEN) {
+                gmOffsetAlibiRow = 0;
+                alibiDelta = kvSStartIdx;
+                gmOffsetAlibiColumn = 0;
+            } else if (alibiBlockStart > -Q_BLOCK_SIZE && alibiBlockStart < 0) {
+                gmOffsetAlibiRow = 0;
+                alibiDelta = triUp;
+                gmOffsetAlibiColumn = - alibiBlockStart;
+            }
+        } else {
+            // 右对齐
+            if (alibiBlockStart >= (COMP_TRIU_MASK_DIM_LEN - Q_BLOCK_SIZE)) {
+                gmOffsetAlibiRow = 1024;  // 超过1920时取1024处的数据
+                alibiDelta = alibiBlockStart - 1024;
+                gmOffsetAlibiColumn = 0;
+            } else if (alibiBlockStart >= 0 && alibiBlockStart < COMP_TRIU_MASK_DIM_LEN) {
+                gmOffsetAlibiRow = alibiBlockStart;
+                gmOffsetAlibiColumn = 0;
+            } else if (alibiBlockStart > - Q_BLOCK_SIZE && alibiBlockStart < 0) {
+                gmOffsetAlibiRow = 0;
+                gmOffsetAlibiColumn = - alibiBlockStart;
+            }
+        }
+        offsetAlibi =
+            layoutMask.GetOffset(MatrixCoord(gmOffsetAlibiRow + maskOffsetThisSubBlock, gmOffsetAlibiColumn));
+    }
+
+    __aicore__ inline
+    void CopyAlibiGmToUb(
+        AscendC::GlobalTensor<ElementAlibi> gAlibi, AscendC::GlobalTensor<ElementInput> gAlibiCoeff,
+        uint32_t columnNum, uint32_t columnNumRound, uint32_t maskStride, uint32_t tokenNumPerHead,
+        uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t integralHeadNum, uint32_t epiTokenNum,
+        uint32_t &qNStartIdxVec, uint32_t qNThisSubBlock, bool alibiLeftAlign, bool isAlibiSqrt, int32_t alibiDelta)
+    {
+        uint32_t innerUbRowOffset = 0;
+        if (proTokenNum != 0) {
+            AscendC::DataCopyPad(
+                alibiUbTensor[innerUbRowOffset], gAlibi[proTokenIdx * maskStride],
+                AscendC::DataCopyExtParams(
+                    proTokenNum, columnNum * sizeof(ElementAlibi),
+                    (maskStride - columnNum) * sizeof(ElementAlibi),
+                    (columnNumRound - columnNum) * sizeof(ElementAlibi) / BLOCK_SIZE_IN_BYTE, 0),
+                AscendC::DataCopyPadExtParams<ElementAlibi>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            UpCastAndScaleAlibi(gAlibiCoeff, innerUbRowOffset, qNStartIdxVec, proTokenNum,
+                columnNumRound, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+            innerUbRowOffset += proTokenNum * columnNumRound;
+        }
+        for (uint32_t headIdx = 0; headIdx < integralHeadNum; headIdx++) {
+            if (qNThisSubBlock >= HEAD_NUM_2) {
+                if (proTokenNum > 0 && headIdx == 0) {
+                    qNStartIdxVec++;
+                }
+                if (headIdx > 0) {
+                    qNStartIdxVec++;
+                }
+            }
+            AscendC::DataCopyPad(
+                alibiUbTensor[innerUbRowOffset], gAlibi,
+                AscendC::DataCopyExtParams(
+                    tokenNumPerHead, columnNum * sizeof(ElementAlibi),
+                    (maskStride - columnNum) * sizeof(ElementAlibi),
+                    (columnNumRound - columnNum) * sizeof(ElementAlibi) / BLOCK_SIZE_IN_BYTE, 0),
+                AscendC::DataCopyPadExtParams<ElementAlibi>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            UpCastAndScaleAlibi(gAlibiCoeff, innerUbRowOffset, qNStartIdxVec, tokenNumPerHead,
+                columnNumRound, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+            innerUbRowOffset += tokenNumPerHead * columnNumRound;
+        }
+        if (epiTokenNum != 0) {
+            if (qNThisSubBlock >= HEAD_NUM_2) {
+                qNStartIdxVec++;
+            }
+            AscendC::DataCopyPad(
+                alibiUbTensor[innerUbRowOffset], gAlibi,
+                AscendC::DataCopyExtParams(
+                    epiTokenNum, columnNum * sizeof(ElementAlibi),
+                    (maskStride - columnNum) * sizeof(ElementAlibi),
+                    (columnNumRound - columnNum) * sizeof(ElementAlibi) / BLOCK_SIZE_IN_BYTE, 0),
+                AscendC::DataCopyPadExtParams<ElementAlibi>(false, 0, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            UpCastAndScaleAlibi(gAlibiCoeff, innerUbRowOffset, qNStartIdxVec, epiTokenNum,
+                columnNumRound, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+        }
+    }
+
+    __aicore__ inline
+    void UpCastAndScaleAlibi(AscendC::GlobalTensor<ElementInput> gAlibiCoeff, uint32_t innerUbRowOffset,
+        uint32_t qNStartIdxVec, uint32_t rowNumCurLoop, uint32_t columnNumRound, bool alibiLeftAlign,
+        bool isAlibiSqrt, int32_t alibiDelta)
+    {
+        UpCastMask<float, ElementAlibi>(alibiUbTensor32[innerUbRowOffset], alibiUbTensor[innerUbRowOffset],
+            rowNumCurLoop, columnNumRound);
+        alibiCoeffPerHead = gAlibiCoeff.GetValue(qNStartIdxVec);
+        if (alibiDelta > 0) {
+            if (!alibiLeftAlign && isAlibiSqrt) {
+                AscendC::Mul<float, false>(alibiUbTensor32[innerUbRowOffset],
+                    alibiUbTensor32[innerUbRowOffset],
+                    alibiUbTensor32[innerUbRowOffset],
+                    (uint64_t)0,
+                    CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+                    AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if (alibiLeftAlign || isAlibiSqrt) {
+                AscendC::Adds<float, false>(
+                    alibiUbTensor32[innerUbRowOffset],
+                    alibiUbTensor32[innerUbRowOffset],
+                    (float)alibiDelta,
+                    (uint64_t)0,
+                    CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            } else {
+                AscendC::Adds<float, false>(
+                    alibiUbTensor32[innerUbRowOffset],
+                    alibiUbTensor32[innerUbRowOffset],
+                    (float)-alibiDelta,
+                    (uint64_t)0,
+                    CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            if (!alibiLeftAlign && isAlibiSqrt) {
+                alibiCoeffPerHead = -alibiCoeffPerHead;
+                AscendC::Sqrt<float, false>(
+                    alibiUbTensor32[innerUbRowOffset],
+                    alibiUbTensor32[innerUbRowOffset],
+                    (uint64_t)0,
+                    CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+                    AscendC::UnaryRepeatParams(1, 1, 8, 8));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+        ScaleAlibi(innerUbRowOffset, rowNumCurLoop, columnNumRound);
+    }
+
+    __aicore__ inline
+    void ScaleAlibi(uint32_t innerUbRowOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
+    {
+        AscendC::Muls<float, false>(
+            alibiUbTensor32[innerUbRowOffset],
+            alibiUbTensor32[innerUbRowOffset],
+            alibiCoeffPerHead,
+            (uint64_t)0,
+            CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+            AscendC::UnaryRepeatParams(1, 1, 8, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline
     void ScaleS(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
         AscendC::Muls<float, false>(
@@ -523,6 +699,19 @@ public:
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
         }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline
+    void ApplyAlibi(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
+    {
+        AscendC::Add<float, false>(
+            lsUbTensor[sUbOffset],
+            lsUbTensor[sUbOffset],
+            alibiUbTensor32,
+            (uint64_t)0,
+            CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
+            AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -1034,13 +1223,215 @@ public:
         }
     }
 
+    __aicore__ inline
+    void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementAlibi> gAlibi, AscendC::GlobalTensor<ElementInput> gAlibiCoeff,
+        AscendC::GlobalTensor<ElementMask> gMask,const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
+        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
+        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t kvSStartIdx,
+        uint32_t kvSEndIdx, uint32_t qNStartIdx, bool alibiLeftAlign, bool isAlibiSqrt, bool doTriUMask)
+    {
+        uint32_t rowNum = actualBlockShape.m();
+        uint32_t columnNum = actualBlockShape.n();
+        uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE_IN_BYTE);
+        uint32_t columnNumPad = layoutInput.stride(0);
+        uint32_t maskStride = layoutMask.stride(0);
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+
+        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum; // 1
+        uint32_t qNThisSubBlock = (qNBlockSize == 1) ?
+            0 : (subBlockIdx == 1) ? (qNBlockSize - qNSplitSubBlock) : qNSplitSubBlock; // 1
+        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
+            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
+        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
+            (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
+        uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        uint32_t tokenNumPerHeadThisSubBlock = Min(qSBlockSize, rowActualThisSubBlock);
+        uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ?
+            rowOffsetThisSubBlock : 0;
+        // calc qNstartIdx per vec core
+        uint32_t qNStartIdxVec =  (qNBlockSize == 1) ? qNStartIdx : (subBlockIdx == 1) ? (qNStartIdx + qNSplitSubBlock) : qNStartIdx;
+        // calc mask shift in gm
+        uint32_t addMaskUbOffset;
+        uint32_t maskColumn;
+        int64_t offsetMask;
+        uint32_t maskColumnRound;
+        if (doTriUMask) {
+            uint32_t gmOffsetMaskRow;
+            uint32_t gmOffsetMaskColumn;
+            if (triUp >= kvSStartIdx) {
+                uint32_t triUpRoundDown = RoundDown(triUp, BLOCK_SIZE_IN_BYTE);
+                gmOffsetMaskRow = triUp - triUpRoundDown;
+                gmOffsetMaskColumn = 0;
+                maskColumn = kvSEndIdx - triUpRoundDown;
+                addMaskUbOffset = triUpRoundDown - kvSStartIdx;
+            } else {
+                gmOffsetMaskRow = 0;
+                gmOffsetMaskColumn = kvSStartIdx - triUp;
+                maskColumn = columnNum;
+                addMaskUbOffset = 0;
+            }
+            maskColumnRound = RoundUp(maskColumn, BLOCK_SIZE_IN_BYTE);
+            offsetMask =
+                layoutMask.GetOffset(MatrixCoord(gmOffsetMaskRow + maskOffsetThisSubBlock, gmOffsetMaskColumn));
+        }
+        // calc alibi  shift in gm
+        int32_t alibiDelta = 0;
+        int64_t offsetAlibi = 0;
+        CalcGmAlibiShift(alibiLeftAlign, offsetAlibi, alibiDelta, layoutMask, triUp, kvSStartIdx, maskOffsetThisSubBlock);
+        auto gAlibiThisSubBlock = gAlibi[offsetAlibi];
+
+        uint32_t maxRowNumPerLoop = MAX_UB_S_ELEM_NUM / columnNumRound;
+        uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
+        rowNumTile = AscendC::Std::min(rowNumTile, FLOAT_VECTOR_SIZE);
+        uint32_t rowLoopNum = CeilDiv(rowActualThisSubBlock, rowNumTile);
+        uint32_t preLoad = 1;
+
+        if (rowActualThisSubBlock == 0) {
+            Arch::CrossCoreWaitFlag(qkReady);
+            return;
+        }
+        uint32_t proTokenIdx;
+        uint32_t proTokenNum;
+        uint32_t integralHeadNum;
+        uint32_t epiTokenNum;
+        for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
+            if (rowLoopIdx < rowLoopNum) {
+                uint32_t pingpongFlag = rowLoopIdx % 2;
+                uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
+                uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
+                uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
+                    (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
+                // loop 0 mask load before cross core sync
+                if (rowLoopIdx == 0) {
+                    // the token idx of the start token of the prologue part
+                    proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
+                    // the token num of the prologue part
+                    proTokenNum =
+                        Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
+                    // the token num of the epilogue part
+                    integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
+                    // the number of integral heads within a cycle
+                    epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    if (doTriUMask) {
+                        CopyMaskGmToUb(
+                            gMask[offsetMask],
+                            maskColumn, maskColumnRound, maskStride,
+                            tokenNumPerHeadThisSubBlock,
+                            proTokenIdx, proTokenNum, integralHeadNum, epiTokenNum);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                    } else {
+                        CopyAlibiGmToUb(
+                        gAlibiThisSubBlock, gAlibiCoeff,
+                        columnNum, columnNumRound, maskStride,
+                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum, epiTokenNum,
+                        qNStartIdxVec, qNThisSubBlock, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+                    }
+                    Arch::CrossCoreWaitFlag(qkReady);
+                }
+                int64_t offsetInput = layoutInput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
+                auto gInputCurLoop = gInput[offsetInput];
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
+                CopySGmToUb(
+                    gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+            }
+            if (rowLoopIdx >= preLoad) {
+                uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
+                uint32_t pingpongFlag = delayedRowLoopIdx % 2;
+                uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
+                uint32_t rowNumCurLoop = (delayedRowLoopIdx == rowLoopNum - 1) ?
+                    (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
+
+                if (doTriUMask) {
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                    UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
+                    UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
+                }
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+                ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if (doTriUMask) {
+                    ApplyMask(
+                        (pingpongFlag * MAX_UB_S_ELEM_NUM),
+                        rowNumCurLoop, columnNumRound,
+                        maskColumnRound, addMaskUbOffset);
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+                    CopyAlibiGmToUb(
+                        gAlibiThisSubBlock, gAlibiCoeff,
+                        columnNum, columnNumRound, maskStride,
+                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum, epiTokenNum,
+                        qNStartIdxVec, qNThisSubBlock, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+                }
+                ApplyAlibi((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                // next loop mask load
+                // online softmax vectorized compute
+                uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
+                int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
+                auto gOutputCurLoop = gOutput[offsetOutput];
+                auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
+                SubCoreCompute<true>(
+                    gOutputCurLoop,
+                    layoutOutputCurLoop,
+                    rowOffsetCurLoop,
+                    isFirstStackTile,
+                    0,
+                    delayedRowLoopIdx == 0,
+                    delayedRowLoopIdx == rowLoopNum - 1,
+                    columnNumRound,
+                    pingpongFlag,
+                    curStackTileMod);
+                if (rowLoopIdx < rowLoopNum) {
+                    uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
+                    uint32_t rowNumCurLoop =
+                        (rowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
+                    // the token idx of the start token of the prologue part
+                    proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
+                    // the token num of the prologue part
+                    proTokenNum =
+                        Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
+                    if ((qNThisSubBlock >= HEAD_NUM_2) && (proTokenIdx == 0) && proTokenNum > 0) {
+                        qNStartIdxVec++;
+                    }
+                    // the number of integral heads within a cycle
+                    integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
+                    if ((qNThisSubBlock >= HEAD_NUM_2) && integralHeadNum > 0 && proTokenNum == 0) {
+                        qNStartIdxVec++;
+                    }
+                    // the token num of the epilogue part
+                    epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    if (doTriUMask) {
+                        CopyMaskGmToUb(
+                            gMask[offsetMask],
+                            maskColumn, maskColumnRound, maskStride,
+                            tokenNumPerHeadThisSubBlock,
+                            proTokenIdx, proTokenNum, integralHeadNum, epiTokenNum);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+                    } else {
+                        CopyAlibiGmToUb(
+                        gAlibiThisSubBlock, gAlibiCoeff,
+                        columnNum, columnNumRound, maskStride,
+                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum, epiTokenNum,
+                        qNStartIdxVec, qNThisSubBlock, alibiLeftAlign, isAlibiSqrt, alibiDelta);
+                    }
+                }
+            }
+        }
+    }
+
 private:
     float scaleValue;
+    float alibiCoeffPerHead;
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;
     AscendC::LocalTensor<half> maskUbTensor16;
     AscendC::LocalTensor<float> maskUbTensor32;
+    AscendC::LocalTensor<ElementAlibi> alibiUbTensor;
+    AscendC::LocalTensor<float> alibiUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> gmUbTensor;
