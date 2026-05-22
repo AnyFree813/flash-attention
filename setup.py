@@ -261,10 +261,14 @@ class BishengBuildExt(build_ext):
             "bisheng",
             "-x", "asc",
             "--npu-arch=dav-2201",
+            "--cce-enable-print",
             "-shared",
             "-fPIC",
             "-std=c++17",
-            "-D_GLIBCXX_USE_CXX11_ABI=0",
+            "-D_GLIBCXX_USE_CXX11_ABI=1",
+            "-DENABLE_ASCENDC_DUMP",
+            "-DASCENDC_DUMP=1",
+            "-DASCENDC_DEBUG",
             *[f"-I{p}" for p in asc_config["include_dirs"]],
             f"-I{dep_paths['python']['include']}",
             f"-I{dep_paths['torch_npu']['include']}",
@@ -285,6 +289,7 @@ class BishengBuildExt(build_ext):
             "-ltorch_npu",
             "-ltiling_api",
             "-lplatform",
+            "-lascend_dump",
             *ext.sources,
             "-o", ext_fullpath,
         ]
@@ -312,7 +317,7 @@ if os.path.isdir(".git"):
     if not SKIP_CK_BUILD:
         subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
         subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/catlass"], check=True)
+        subprocess.run(["git", "submodule", "update", "--init", "--remote", "csrc/catlass"], check=True)
 else:
     if IS_ROCM:
         if not SKIP_CK_BUILD:

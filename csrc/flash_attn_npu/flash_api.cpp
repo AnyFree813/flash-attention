@@ -1,13 +1,15 @@
 #include <torch/extension.h>
 
-#include "mha_fwd_kvcache.cpp"
-#include "tilingdata.h"
-#include "torch_npu/csrc/core/npu/NPUStream.h"
+//#include "mha_fwd_kvcache.cpp"
+//#include "tilingdata.h"
 #include "acl/acl.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "mha_varlen_bwd.cpp"
+#include "fag_tiling.cpp"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "runtime/rt_ffts.h"
 #include "kernel_common.hpp"
 #include "kernel_operator.h"
-#include "tiling/platform/platform_ascendc.h"
 
 uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
@@ -223,8 +225,153 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     return {out, softmaxlse};
 }
 
+std::vector<at::Tensor>
+mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads x head_size
+               const at::Tensor &q,                      // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &k,                      // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &v,                      // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &out,                    // total_q x num_heads x head_size
+            //    const at::Tensor &softmax_lse,            // b x h x s   softmax logsumexp
+               const at::Tensor &softmax_max,            // b x h x s   softmax max
+               const at::Tensor &softmax_sum,            // b x h x s   softmax sum
+               std::optional<at::Tensor> &dq_,           // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dk_,           // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dv_,           // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &cu_seqlens_q,           // b+1
+               const at::Tensor &cu_seqlens_k,           // b+1
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               const int max_seqlen_q,
+               const int max_seqlen_k, // max sequence length to choose the kernel
+               const float p_dropout,  // probability to drop
+               const float softmax_scale,
+               const bool zero_tensors,
+               const bool is_causal,
+               int window_size_left,
+               int window_size_right,
+               const float softcap,
+               const bool deterministic,
+               std::optional<at::Generator> gen_,
+               std::optional<at::Tensor> &rng_state)
+{
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
+    uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+
+    // input/output tensor
+    at::Tensor seqlens_q, seqlens_k;
+    at::Tensor dq, dk, dv;
+    bool is_bf16 = q.dtype() == torch::kBFloat16;
+
+    seqlens_q = cu_seqlens_q;
+    seqlens_k = cu_seqlens_k;
+    
+    if (dq_.has_value()) {
+        dq = dq_.value();
+    }  else {
+        dq = torch::empty_like(q);
+    }
+    if (dk_.has_value()) {
+        dk = dk_.value();
+    }  else {
+        dk = torch::empty_like(k);
+    }
+    if (dv_.has_value()) {
+        dv = dv_.value();
+    }  else {
+        dv = torch::empty_like(v);
+    }
+
+    // parse shape args
+    auto qsizes = q.sizes();
+    auto ksizes = k.sizes();
+    uint32_t nheads = qsizes[1];
+    uint32_t nheads_k = ksizes[1];
+    uint32_t headdim = qsizes[2];
+
+    // tiling args set
+    uint32_t tilingSize = TILING_PARA_NUM * sizeof(int64_t);
+    at::Tensor tiling_cpu_tensor = at::empty({tilingSize}, at::device(c10::kCPU).dtype(at::kByte));
+    FAGTiling::FAGInfo fagInfo;
+    int64_t sum_of_list = qsizes[0];
+    fagInfo.seqQShapeSize = cu_seqlens_q.sizes()[0] - 1;
+    fagInfo.queryShape_0 = sum_of_list;
+    fagInfo.keyShape_0 = sum_of_list;
+    fagInfo.queryShape_1 = nheads;
+    fagInfo.keyShape_1 = nheads_k;
+    fagInfo.queryShape_2 = headdim;
+    fagInfo.scaleValue = 1.0 / sqrt(headdim);
+    FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
+    FAGTiling::printFAGTilingData(reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()));
+    at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+
+    // alloc workspace
+    uint64_t workspaceSize = (2 * blockDim * 16 * 128 * 128 * 8 * nheads) * sizeof(float);
+    at::Tensor workspace_tensor = at::empty({static_cast<long>(workspaceSize)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+
+    // alloc custom attn_mask
+    at::Tensor mask_gpu_tensor;
+    if (is_causal) {
+        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+    }
+    at::Tensor seqlenq_gpu_tensor = seqlens_q.to(at::Device(at::kPrivateUse1));
+    at::Tensor seqlenk_gpu_tensor = seqlens_k.to(at::Device(at::kPrivateUse1));
+    
+    uint64_t fftsAddr{0};
+    uint32_t fftsLen{0};
+    rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
+    auto qDevice = static_cast<uint8_t *>(const_cast<void *>(q.storage().data()));
+    auto kDevice = static_cast<uint8_t *>(const_cast<void *>(k.storage().data()));
+    auto vDevice = static_cast<uint8_t *>(const_cast<void *>(v.storage().data()));
+    auto outDevice = static_cast<uint8_t *>(const_cast<void *>(out.storage().data()));
+    auto dOutDevice = static_cast<uint8_t *>(const_cast<void *>(dout.storage().data()));
+    uint8_t *attenMaskDevice = nullptr;
+    if (is_causal) {
+        attenMaskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.storage().data()));
+    }
+    auto cuSeqQlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenq_gpu_tensor.storage().data()));
+    auto cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.storage().data()));
+    auto softMaxMaxDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_max.storage().data()));
+    auto softMaxSumDevice = static_cast<uint8_t *>(const_cast<void *>(softmax_sum.storage().data()));
+
+    auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.storage().data()));
+    auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.storage().data()));
+    auto dqDevice = static_cast<uint8_t *>(const_cast<void *>(dq.storage().data()));
+    auto dkDevice = static_cast<uint8_t *>(const_cast<void *>(dk.storage().data()));
+    auto dvDevice = static_cast<uint8_t *>(const_cast<void *>(dv.storage().data()));
+
+    #if defined(ENABLE_ASCENDC_DUMP)
+        // alloc ptr
+        std::cout << "call dump function " << std::endl;
+        // at::Tensor ptrDump_tensor = at::empty({static_cast<uint8_t>(ALL_DUMPSIZE)}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        // auto ptrDumpDevice = static_cast<uint8_t *>(const_cast<void *>(ptrDump_tensor.storage().data()));
+
+        uint8_t *ptrDumpDevice{nullptr};
+        aclCheck(aclrtMalloc(reinterpret_cast<void **>(&ptrDumpDevice), ALL_DUMPSIZE, ACL_MEM_MALLOC_HUGE_FIRST));
+        
+        FAG::FAG<<<blockDim, nullptr, aclStream>>>(
+            fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+            attenMaskDevice, softMaxMaxDevice, softMaxSumDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+            nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, ptrDumpDevice);
+        aclCheck(aclrtSynchronizeStream(aclStream));
+        std::cout << "begin print workspace " << std::endl;
+        Adx::AdumpPrintWorkSpace(ptrDumpDevice, ALL_DUMPSIZE, aclStream, "device_fag");
+        aclCheck(aclrtFree(ptrDumpDevice));
+    #else
+        FAG<<<blockDim, nullptr, aclStream>>>(
+            fftsAddr, qDevice, kDevice, vDevice, dOutDevice, nullptr, nullptr, nullptr, nullptr, nullptr,
+            attenMaskDevice, softMaxMaxDevice, softMaxSumDevice, nullptr, outDevice, nullptr, cuSeqQlenDevice, cuSeqKvlenDevice,
+            nullptr, nullptr, dqDevice, dkDevice, dvDevice, workspaceDevice, tilingDevice, nullptr);
+    #endif
+    auto opts = q.options();
+    auto softmax_d = torch::empty({fagInfo.seqQShapeSize, nheads, max_seqlen_q}, opts.dtype(at::kFloat));
+    return {dq, dk, dv, softmax_d};
+}
+
+
 PYBIND11_MODULE(flash_attn_2_cuda, m)
 {
     m.doc() = "FlashAttention";
-    m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+//    m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+    m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
 }

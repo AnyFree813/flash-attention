@@ -331,16 +331,18 @@ if torch.__version__ >= "2.4.0":
     _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
 else:
     _wrapped_flash_attn_backward = _flash_attn_backward
+_wrapped_flash_attn_backward = _flash_attn_backward
 
-
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=["cuda", "npu"])
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
-    softmax_lse: torch.Tensor,
+    # softmax_lse: torch.Tensor,
+    softmax_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
@@ -360,6 +362,7 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
+    print("call custom op wrapper")
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
         dq,
@@ -372,7 +375,9 @@ def _flash_attn_varlen_backward(
         k,
         v,
         out,
-        softmax_lse,
+        # softmax_lse,
+        softmax_max,
+        softmax_sum,
         dq,
         dk,
         dv,
@@ -441,11 +446,11 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
-else:
-    _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
-
+# if torch.__version__ >= "2.4.0":
+#     _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
+# else:
+#     _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
+_wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
@@ -1614,3 +1619,60 @@ def flash_attn_with_kvcache(
         num_splits,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+# direct varlen backward interface
+def flash_attn_varlen_func_backward(
+    dout, q, k, v, out,
+    # softmax_lse,
+    softmax_max,
+    softmax_sum,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None):
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    head_size_og = dout.size(2)
+    dout_padded = dout
+    if head_size_og % 8 != 0:
+        dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+    print("call custom varlen interface")
+    _wrapped_flash_attn_varlen_backward(
+        dout_padded,
+        q,
+        k,
+        v,
+        out,
+        # softmax_lse,
+        softmax_max,
+        softmax_sum,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        alibi_slopes,
+        deterministic,
+        rng_state=None,
+    )
+    dq = dq[..., : dout.shape[-1]]
+    dk = dk[..., : dout.shape[-1]]
+    dv = dv[..., : dout.shape[-1]]
+    return dq, dk, dv

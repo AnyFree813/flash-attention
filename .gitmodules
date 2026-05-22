@@ -7,4 +7,5 @@
 	branch = amd-master
 [submodule "csrc/catlass"]
 	path = csrc/catlass
-	url = https://gitcode.com/cann/catlass.git
+	url = https://gitcode.com/xuanyuandy/catlass.git
+	branch = master_tridao
